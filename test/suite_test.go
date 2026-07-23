@@ -3,7 +3,6 @@ package integration
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -15,7 +14,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	"github.com/jmelis/postgres-controller-backend/pkg/pgruntime"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -31,7 +29,6 @@ import (
 	hyperfleetv1alpha1 "github.com/typeid/hyperfleet-operator/api/v1alpha1"
 	"github.com/typeid/hyperfleet-operator/internal/controller"
 	dynamo "github.com/typeid/hyperfleet-operator/internal/dynamo"
-	"github.com/typeid/hyperfleet-operator/internal/dynamo/statusstream"
 	"github.com/typeid/hyperfleet-operator/internal/render"
 )
 
@@ -68,8 +65,6 @@ var _ = BeforeSuite(func() {
 	if containerTool == "" {
 		containerTool = "podman"
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
 	// ── Postgres ──
 
 	By("starting Postgres container")
@@ -204,24 +199,6 @@ var _ = BeforeSuite(func() {
 		return mgr.GetCache().WaitForCacheSync(ctx)
 	}, 10*time.Second, 100*time.Millisecond).Should(BeTrue(), "pgruntime cache did not sync")
 
-	// ── DynamoDB Streams ──
-
-	By("starting DynamoDB status stream watchers")
-	streamsClient := dynamodbstreams.NewFromConfig(aws.Config{
-		Region:       "us-east-1",
-		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", "test"),
-		BaseEndpoint: aws.String(fmt.Sprintf("http://127.0.0.1:%s", ddbPort)),
-	})
-	streamMgr := statusstream.NewManager(
-		dynamoDBCli,
-		streamsClient,
-		mgr.GetClient(),
-		[]string{dynamo.TableSuffixStatusApplyDesires, dynamo.TableSuffixStatusReadDesires},
-		func(documentID string) { eventRouter.Dispatch(documentID) },
-		logger.With("component", "statusstream"),
-	)
-	go streamMgr.Run(ctx, 5*time.Second)
-
 	// ── kube-applier-aws simulators ──
 
 	// Simulate kube-applier-aws: poll specs-applydesires and write status
@@ -268,15 +245,20 @@ var _ = BeforeSuite(func() {
 					if err != nil {
 						continue
 					}
+					docIDStr := docID.(*dynamodbtypes.AttributeValueMemberS).Value
 					statusItem := map[string]dynamodbtypes.AttributeValue{
 						"documentID": docID,
 						"status":     &dynamodbtypes.AttributeValueMemberM{Value: statusAttrs},
 					}
-					_, _ = dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
+					_, putErr := dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
 						TableName:           aws.String(statusTable),
 						Item:                statusItem,
 						ConditionExpression: aws.String("attribute_not_exists(documentID)"),
 					})
+					if putErr == nil {
+						// Notify the operator directly (replaces DynamoDB Streams watcher)
+						eventRouter.Dispatch(docIDStr)
+					}
 				}
 			}
 		}
@@ -309,14 +291,19 @@ var _ = BeforeSuite(func() {
 					if !ok {
 						continue
 					}
-					_, _ = dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
+					docIDStr := docID.(*dynamodbtypes.AttributeValueMemberS).Value
+					_, putErr := dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
 						TableName: aws.String(statusTable),
 						Item: map[string]dynamodbtypes.AttributeValue{
-							"documentID":          docID,
-							"status_kubeContent":  &dynamodbtypes.AttributeValueMemberS{Value: string(completedJob)},
+							"documentID":         docID,
+							"status_kubeContent": &dynamodbtypes.AttributeValueMemberS{Value: string(completedJob)},
 						},
 						ConditionExpression: aws.String("attribute_not_exists(documentID)"),
 					})
+					if putErr == nil {
+						// Notify the operator directly (replaces DynamoDB Streams watcher)
+						eventRouter.Dispatch(docIDStr)
+					}
 				}
 			}
 		}
@@ -369,12 +356,6 @@ func createTables(db *dynamodb.Client) {
 					},
 				},
 				BillingMode: dynamodbtypes.BillingModePayPerRequest,
-			}
-			if prefix == mc+"-status" {
-				input.StreamSpecification = &dynamodbtypes.StreamSpecification{
-					StreamEnabled:  aws.Bool(true),
-					StreamViewType: dynamodbtypes.StreamViewTypeNewAndOldImages,
-				}
 			}
 			_, err := db.CreateTable(context.Background(), input)
 			Expect(err).NotTo(HaveOccurred(), "create table %s", tableName)
