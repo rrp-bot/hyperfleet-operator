@@ -203,6 +203,12 @@ var _ = BeforeSuite(func() {
 
 	// Simulate kube-applier-aws: poll specs-applydesires and write status
 	// entries with Successful=True so controllers see apply confirmations.
+	//
+	// We always overwrite the status entry (no ConditionExpression) so that
+	// when a desire is updated to Type=Delete with a new updateTime, the next
+	// poll produces a fresh ObservedDesireUpdateTime >= the desire's updateTime.
+	// Without this, CheckApplyDesireStatuses rejects stale statuses and the
+	// controller loops forever waiting for delete confirmation.
 	go func() {
 		defer GinkgoRecover()
 		specsTable := mc + "-specs-applydesires"
@@ -250,13 +256,14 @@ var _ = BeforeSuite(func() {
 						"documentID": docID,
 						"status":     &dynamodbtypes.AttributeValueMemberM{Value: statusAttrs},
 					}
-					_, putErr := dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
-						TableName:           aws.String(statusTable),
-						Item:                statusItem,
-						ConditionExpression: aws.String("attribute_not_exists(documentID)"),
-					})
-					if putErr == nil {
-						// Notify the operator directly (replaces DynamoDB Streams watcher)
+					// Unconditional put: overwrites stale status so delete
+					// desires with a newer updateTime are confirmed promptly.
+					if _, putErr := dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
+						TableName: aws.String(statusTable),
+						Item:      statusItem,
+					}); putErr == nil {
+						// Always dispatch so the controller is notified on
+						// both first write and subsequent overwrites.
 						eventRouter.Dispatch(docIDStr)
 					}
 				}
