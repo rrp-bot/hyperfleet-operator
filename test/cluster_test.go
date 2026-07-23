@@ -155,14 +155,13 @@ var _ = Describe("Cluster lifecycle", func() {
 		_, err = dynamoDBCli.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(statusTable),
 			Item: map[string]dynamodbtypes.AttributeValue{
-				"documentID":  &dynamodbtypes.AttributeValueMemberS{Value: readDocID},
-				"kubeContent": &dynamodbtypes.AttributeValueMemberB{Value: hcJSON},
+				"documentID":         &dynamodbtypes.AttributeValueMemberS{Value: readDocID},
+				"status_kubeContent": &dynamodbtypes.AttributeValueMemberS{Value: string(hcJSON)},
 			},
 		})
 		Expect(err).NotTo(HaveOccurred())
 
-		// DynamoDB Local streams are not reliable enough to deliver events
-		// within test timeouts, so dispatch manually to trigger re-reconciliation.
+		// Dispatch directly to trigger re-reconciliation (no DynamoDB Streams).
 		eventRouter.Dispatch(readDocID)
 
 		By("verifying Cluster CR status is updated with HostedCluster data")
